@@ -4,11 +4,14 @@
 #ifndef RIGTORP_SPSCQUEUE_H
 #define RIGTORP_SPSCQUEUE_H
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
-#include <functional>  // std::invoke
+#include <functional> // std::invoke
+#include <limits>
 #include <memory>      // std::allocator, std::construct_at, std::destroy_at
 #include <type_traits> // std::is_*_v
 #include <utility>     // std::forward
@@ -28,6 +31,21 @@
 #endif
 
 namespace rigtorp {
+
+enum class WaitPolicy { Spin, Atomic };
+
+struct DefaultConfig {
+  static constexpr WaitPolicy producerWaitPolicy = WaitPolicy::Spin;
+  static constexpr WaitPolicy consumerWaitPolicy = WaitPolicy::Spin;
+  static constexpr bool completable = false;
+};
+
+template <typename Config>
+concept SPSCQueueConfig = requires {
+  requires std::same_as<decltype(Config::producerWaitPolicy), const WaitPolicy>;
+  requires std::same_as<decltype(Config::consumerWaitPolicy), const WaitPolicy>;
+  requires std::same_as<decltype(Config::completable), const bool>;
+};
 
 /// @brief Fixed-capacity queue for one producer and one consumer.
 ///
@@ -51,7 +69,8 @@ namespace rigtorp {
 ///
 /// User constructors, assignment operators, destructors, and callbacks execute
 /// on the calling thread and may themselves block.
-template <typename T, typename Allocator = std::allocator<T>>
+template <typename T, SPSCQueueConfig Config = DefaultConfig,
+          typename Allocator = std::allocator<T>>
   requires std::is_nothrow_destructible_v<T>
 class SPSCQueue {
 public:
@@ -68,9 +87,8 @@ public:
     if (writer_.capacity < 1) {
       writer_.capacity = 1;
     }
-    // Prevent overflowing size_t
-    if (writer_.capacity > SIZE_MAX - 2 * kPadding - 1) {
-      writer_.capacity = SIZE_MAX - 2 * kPadding - 1;
+    if (writer_.capacity >= kMaxRingCapacity) {
+      writer_.capacity = kMaxRingCapacity - 1;
     }
     writer_.capacity++; // Needs one slack element
 
@@ -81,17 +99,24 @@ public:
       auto res =
           writer_.allocator.allocate_at_least(writer_.capacity + 2 * kPadding);
       writer_.slots = res.ptr;
-      writer_.capacity = res.count - 2 * kPadding;
+      if constexpr (Config::completable) {
+        writer_.capacity =
+            (std::min<size_t>)(res.count - 2 * kPadding, kMaxRingCapacity);
+      } else {
+        writer_.capacity = res.count - 2 * kPadding;
+      }
+      writer_.allocationCount = res.count;
     } else {
       writer_.slots = std::allocator_traits<Allocator>::allocate(
           writer_.allocator, writer_.capacity + 2 * kPadding);
+      writer_.allocationCount = writer_.capacity + 2 * kPadding;
     }
 
     reader_.slots = writer_.slots;
     reader_.capacity = writer_.capacity;
 
-    static_assert(alignof(SPSCQueue<T>) == kFalseSharingRange);
-    static_assert(sizeof(SPSCQueue<T>) >= 3 * kFalseSharingRange);
+    static_assert(alignof(SPSCQueue) >= kFalseSharingRange);
+    static_assert(sizeof(SPSCQueue) >= 3 * kFalseSharingRange);
     assert(reinterpret_cast<char *>(&readIdx_) -
                reinterpret_cast<char *>(&writeIdx_) >=
            static_cast<std::ptrdiff_t>(kFalseSharingRange));
@@ -104,7 +129,7 @@ public:
       pop();
     }
     std::allocator_traits<Allocator>::deallocate(
-        writer_.allocator, writer_.slots, writer_.capacity + 2 * kPadding);
+        writer_.allocator, writer_.slots, writer_.allocationCount);
   }
 
   SPSCQueue(const SPSCQueue &) = delete;
@@ -127,11 +152,15 @@ public:
     }
     while (nextWriteIdx == writer_.readIdxCache) [[unlikely]] {
       writer_.readIdxCache = readIdx_.load(std::memory_order_acquire);
+      if constexpr (Config::producerWaitPolicy == WaitPolicy::Atomic) {
+        if (nextWriteIdx == writer_.readIdxCache) {
+          readIdx_.wait(nextWriteIdx, std::memory_order_relaxed);
+        }
+      }
     }
     std::construct_at(&writer_.slots[writeIdx + kPadding],
                       std::forward<Args>(args)...);
-    writer_.writeIdx = nextWriteIdx;
-    writeIdx_.store(nextWriteIdx, std::memory_order_release);
+    publish_write(nextWriteIdx);
   }
 
   /// @brief Producer: attempt in-place construction without waiting for space.
@@ -158,8 +187,7 @@ public:
     }
     std::construct_at(&writer_.slots[writeIdx + kPadding],
                       std::forward<Args>(args)...);
-    writer_.writeIdx = nextWriteIdx;
-    writeIdx_.store(nextWriteIdx, std::memory_order_release);
+    publish_write(nextWriteIdx);
     return true;
   }
 
@@ -215,7 +243,8 @@ public:
   [[nodiscard]] RIGTORP_SPSCQUEUE_INLINE T *front() noexcept {
     auto const readIdx = reader_.readIdx;
     if (readIdx == reader_.writeIdxCache) [[unlikely]] {
-      reader_.writeIdxCache = writeIdx_.load(std::memory_order_acquire);
+      reader_.writeIdxCache =
+          decode_write_index(writeIdx_.load(std::memory_order_acquire));
       if (reader_.writeIdxCache == readIdx) {
         return nullptr;
       }
@@ -223,21 +252,56 @@ public:
     return &reader_.slots[readIdx + kPadding];
   }
 
+  [[nodiscard]] RIGTORP_SPSCQUEUE_INLINE T *wait_front() noexcept {
+    auto const readIdx = reader_.readIdx;
+    while (readIdx == reader_.writeIdxCache) {
+      auto const state = writeIdx_.load(std::memory_order_acquire);
+      reader_.writeIdxCache = decode_write_index(state);
+      if (readIdx != reader_.writeIdxCache) {
+        break;
+      }
+      if constexpr (Config::completable) {
+        if (decode_completion_bit(state)) {
+          return nullptr;
+        }
+      }
+      if constexpr (Config::consumerWaitPolicy == WaitPolicy::Atomic) {
+        writeIdx_.wait(state, std::memory_order_relaxed);
+      }
+    }
+    return &reader_.slots[readIdx + kPadding];
+  }
+
+  void complete() noexcept
+    requires(Config::completable)
+  {
+    writeIdx_.store(writer_.writeIdx | kCompletionBit,
+                    std::memory_order_release);
+    if constexpr (Config::consumerWaitPolicy == WaitPolicy::Atomic) {
+      writeIdx_.notify_one();
+    }
+  }
+
+  [[nodiscard]] bool completed() const noexcept
+    requires(Config::completable)
+  {
+    return decode_completion_bit(writeIdx_.load(std::memory_order_acquire));
+  }
+
   /// @brief Consumer: destroy and remove the front item.
   /// @pre front() returned a non-null pointer and that item has not since been
   /// consumed. Calling pop() on an empty queue violates this precondition.
   RIGTORP_SPSCQUEUE_INLINE void pop() noexcept {
     auto const readIdx = reader_.readIdx;
-    // A successful front() has already acquired and cached the write index.
+    // A successful front() or wait_front() has already cached the write index.
     assert(reader_.writeIdxCache != readIdx &&
-           "Can only call pop() after front() has returned a non-nullptr");
+           "pop() requires a successful front() or wait_front()");
     std::destroy_at(&reader_.slots[readIdx + kPadding]);
     auto nextReadIdx = readIdx + 1;
     if (nextReadIdx == reader_.capacity) [[unlikely]] {
       nextReadIdx = 0;
     }
-    reader_.readIdx = nextReadIdx;
-    readIdx_.store(nextReadIdx, std::memory_order_release);
+    publish_read(nextReadIdx);
   }
 
   /// @brief Consumer: process the front item in place, then destroy and remove
@@ -256,7 +320,8 @@ public:
   try_consume(Fn &&fn) noexcept(std::is_nothrow_invocable_v<Fn &&, T &>) {
     auto const readIdx = reader_.readIdx;
     if (readIdx == reader_.writeIdxCache) [[unlikely]] {
-      reader_.writeIdxCache = writeIdx_.load(std::memory_order_acquire);
+      reader_.writeIdxCache =
+          decode_write_index(writeIdx_.load(std::memory_order_acquire));
       if (reader_.writeIdxCache == readIdx) {
         return false;
       }
@@ -267,8 +332,7 @@ public:
     if (nextReadIdx == reader_.capacity) [[unlikely]] {
       nextReadIdx = 0;
     }
-    reader_.readIdx = nextReadIdx;
-    readIdx_.store(nextReadIdx, std::memory_order_release);
+    publish_read(nextReadIdx);
     return true;
   }
 
@@ -301,7 +365,8 @@ public:
   /// @note Independently sampled indices are not a consistent concurrent
   /// snapshot. The result may be stale; it does not reserve items or space.
   [[nodiscard]] size_t size() const noexcept {
-    auto const writeIdx = writeIdx_.load(std::memory_order_acquire);
+    auto const writeIdx =
+        decode_write_index(writeIdx_.load(std::memory_order_acquire));
     auto const readIdx = readIdx_.load(std::memory_order_acquire);
     return writeIdx >= readIdx ? writeIdx - readIdx
                                : writer_.capacity - readIdx + writeIdx;
@@ -312,7 +377,7 @@ public:
   /// snapshot. The result may be stale; use front() before pop(), or a try_
   /// operation to check and consume an item together.
   [[nodiscard]] bool empty() const noexcept {
-    return writeIdx_.load(std::memory_order_acquire) ==
+    return decode_write_index(writeIdx_.load(std::memory_order_acquire)) ==
            readIdx_.load(std::memory_order_acquire);
   }
 
@@ -340,10 +405,48 @@ private:
           ? 0
           : (kFalseSharingRange - 1) / sizeof(T) + 1;
 
+  static constexpr size_t kCompletionBit =
+      size_t{1} << (std::numeric_limits<size_t>::digits - 1);
+  // The largest index is one less than the ring capacity (including slack).
+  static constexpr size_t kMaxRingCapacity =
+      Config::completable ? (std::min)(kCompletionBit, SIZE_MAX - 2 * kPadding)
+                          : SIZE_MAX - 2 * kPadding;
+
+  static constexpr size_t decode_write_index(size_t state) noexcept {
+    if constexpr (Config::completable) {
+      return state & ~kCompletionBit;
+    } else {
+      return state;
+    }
+  }
+
+  static constexpr bool decode_completion_bit(size_t state) noexcept
+    requires(Config::completable)
+  {
+    return (state & kCompletionBit) != 0;
+  }
+
+  RIGTORP_SPSCQUEUE_INLINE void publish_write(size_t idx) noexcept {
+    writer_.writeIdx = idx;
+    writeIdx_.store(idx, std::memory_order_release);
+    if constexpr (Config::consumerWaitPolicy == WaitPolicy::Atomic) {
+      writeIdx_.notify_one();
+    }
+  }
+
+  RIGTORP_SPSCQUEUE_INLINE void publish_read(size_t idx) noexcept {
+    reader_.readIdx = idx;
+    readIdx_.store(idx, std::memory_order_release);
+    if constexpr (Config::producerWaitPolicy == WaitPolicy::Atomic) {
+      readIdx_.notify_one();
+    }
+  }
+
 private:
   // Isolate the shared atomic indices (writeIdx_, readIdx_) on their own
   // kFalseSharingRange-aligned lines so peer polling / spatial prefetching
   // cannot drag the owning thread's private line into Shared state.
+  // The closure bit changes this value without advancing the write index.
   alignas(kFalseSharingRange) std::atomic<size_t> writeIdx_ = {0};
   struct alignas(kFalseSharingRange) {
     // Private copy of writeIdx avoids loading writeIdx_ on enqueue after a
@@ -361,6 +464,8 @@ private:
 #else
     Allocator allocator;
 #endif
+    // Keep the original count even if the usable ring had to be capped.
+    size_t allocationCount = 0;
   } writer_;
   alignas(kFalseSharingRange) std::atomic<size_t> readIdx_ = {0};
   struct alignas(kFalseSharingRange) {
