@@ -252,6 +252,9 @@ public:
     return &reader_.slots[readIdx + kPadding];
   }
 
+  /// @brief Consumer: wait for the front item using the consumer waiting
+  /// policy.
+  /// @return Pointer to the front item, or nullptr if completed and empty.
   [[nodiscard]] RIGTORP_SPSCQUEUE_INLINE T *wait_front() noexcept {
     auto const readIdx = reader_.readIdx;
     while (readIdx == reader_.writeIdxCache) {
@@ -272,6 +275,9 @@ public:
     return &reader_.slots[readIdx + kPadding];
   }
 
+  /// @brief Producer: mark the queue complete and wake a waiting consumer.
+  /// @note May be called while full. Queued items remain
+  /// available. Enqueueing after completion violates a precondition.
   void complete() noexcept
     requires(Config::completable)
   {
@@ -282,6 +288,8 @@ public:
     }
   }
 
+  /// @brief Check from any thread whether the producer has marked the queue
+  /// complete.
   [[nodiscard]] bool completed() const noexcept
     requires(Config::completable)
   {
