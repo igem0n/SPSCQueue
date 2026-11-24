@@ -50,19 +50,22 @@ concept SPSCQueueConfig = requires {
 /// @brief Fixed-capacity queue for one producer and one consumer.
 ///
 /// Nonblocking operations use bounded atomic loads and stores without retry
-/// loops. Their queue synchronization is wait-free (and thus lock-free) when
-/// those atomic operations are wait-free; lock-free std::atomic<size_t> is
-/// necessary but alone does not establish that guarantee. Allocation and user
-/// element operations are excluded. push() and emplace() busy-wait while full
-/// and are not wait-free.
+/// loops. Without atomic notification, their queue synchronization is
+/// wait-free (and thus lock-free) when those atomic operations are wait-free;
+/// lock-free std::atomic<size_t> is necessary but alone does not establish that
+/// guarantee. Atomic notifications have no portable lock-free or wait-free
+/// guarantee. Allocation and user element operations are excluded.
+/// push(), emplace(), and wait_front() may wait indefinitely.
 ///
-/// Enqueue operations belong to the producer; front(), pop(), try_pop(), and
-/// try_consume() belong to the consumer. These two roles may run concurrently.
+/// Enqueue operations and complete() belong to the producer; front(),
+/// wait_front(), pop(), try_pop(), and try_consume() belong to the consumer.
+/// These two roles may run concurrently.
 /// Transferring a role between threads requires external synchronization.
 /// Construction must finish before concurrent access; destruction requires all
 /// other access to have stopped. The queue is neither copyable nor movable.
 ///
 /// @tparam T Element type; must be nothrow destructible.
+/// @tparam Config Selects the waiting policies and completion support.
 /// @tparam Allocator Controls buffer allocation and deallocation only. Element
 /// construction/destruction bypass allocator hooks and do not automatically
 /// propagate this allocator into elements.
@@ -76,7 +79,8 @@ class SPSCQueue {
 public:
   /// @brief Allocate the queue's storage.
   /// @param capacity Requested capacity; zero becomes one. Excessive values are
-  /// clamped to leave room for padding and a slack slot.
+  /// clamped to leave room for padding, a slack slot, and the completion bit
+  /// when enabled.
   /// @param allocator Allocator to copy and use for storage management.
   /// @note allocate_at_least may increase capacity; query capacity() for the
   /// actual value. Allocation and allocator-copy exceptions propagate.
@@ -135,8 +139,9 @@ public:
   SPSCQueue(const SPSCQueue &) = delete;
   SPSCQueue &operator=(const SPSCQueue &) = delete;
 
-  /// @brief Producer: construct an item in place, busy-waiting while full.
-  /// @note May wait indefinitely without consumer progress; does not sleep.
+  /// @brief Producer: construct an item in place, waiting while full.
+  /// @note Uses the producer waiting policy and may wait indefinitely without
+  /// consumer progress.
   /// T must be constructible from the forwarded arguments. If construction
   /// throws, no item is published, but arguments may have been modified.
   template <typename... Args>
@@ -191,7 +196,7 @@ public:
     return true;
   }
 
-  /// @brief Producer: copy an item, busy-waiting while full.
+  /// @brief Producer: copy an item, waiting while full.
   /// @note Requires copy construction; shares emplace()'s waiting and exception
   /// behavior.
   RIGTORP_SPSCQUEUE_INLINE void
@@ -201,8 +206,7 @@ public:
     emplace(v);
   }
 
-  /// @brief Producer: construct from a forwarded value, busy-waiting while
-  /// full.
+  /// @brief Producer: construct from a forwarded value, waiting while full.
   /// @note T must be constructible from P&&; shares emplace()'s waiting and
   /// exception behavior.
   template <typename P>
@@ -297,8 +301,9 @@ public:
   }
 
   /// @brief Consumer: destroy and remove the front item.
-  /// @pre front() returned a non-null pointer and that item has not since been
-  /// consumed. Calling pop() on an empty queue violates this precondition.
+  /// @pre front() or wait_front() returned a non-null pointer and that item
+  /// has not since been consumed. Calling pop() on an empty queue violates
+  /// this precondition.
   RIGTORP_SPSCQUEUE_INLINE void pop() noexcept {
     auto const readIdx = reader_.readIdx;
     // A successful front() or wait_front() has already cached the write index.
