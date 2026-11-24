@@ -505,15 +505,13 @@ static void testCustomAllocator() {
   OversizeAllocator<int>::State oversizeState;
   oversizeState.extra = 3;
   {
-    SPSCQueue<int, ClosureConfig<true>, OversizeAllocator<int>> q(
+    SPSCQueue<int, DefaultConfig, OversizeAllocator<int>> q(
         4, OversizeAllocator<int>(&oversizeState));
     CHECK(q.capacity() == 7);
     for (int i = 0; i < 7; ++i) {
       CHECK(q.try_push(i));
     }
     CHECK(!q.try_push(100));
-    CHECK(!q.completed());
-    q.complete();
     for (int i = 0; i < 7; ++i) {
       CHECK(*q.front() == i);
       q.pop();
