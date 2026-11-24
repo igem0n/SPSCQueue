@@ -35,6 +35,7 @@ if(PROJECT_IS_TOP_LEVEL AND BUILD_TESTING)
     )
     set_target_properties(${target} PROPERTIES
       CXX_EXTENSIONS OFF
+      CXX_SCAN_FOR_MODULES OFF
       COMPILE_WARNING_AS_ERROR ON
     )
     target_compile_options(${target} PRIVATE
