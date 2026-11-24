@@ -1,11 +1,14 @@
 // SPDX-FileCopyrightText: 2018 Erik Rigtorp <erik@rigtorp.se>
 // SPDX-License-Identifier: MIT
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <future>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <rigtorp/SPSCQueue.h>
 #include <set>
@@ -110,6 +113,7 @@ template <typename T> struct OversizeAllocator {
     size_t requested = 0;
     size_t allocated = 0;
     size_t deallocated = 0;
+    size_t reportedCount = 0;
   };
 
   State *state;
@@ -120,13 +124,27 @@ template <typename T> struct OversizeAllocator {
     state->requested = n;
     state->allocated = n + state->extra;
     return {static_cast<T *>(::operator new(state->allocated * sizeof(T))),
-            state->allocated};
+            state->reportedCount ? state->reportedCount : state->allocated};
   }
 
   void deallocate(T *p, size_t n) noexcept {
     state->deallocated = n;
     ::operator delete(p);
   }
+};
+
+template <bool Closable> struct ClosureConfig : rigtorp::DefaultConfig {
+  static constexpr bool completable = Closable;
+};
+
+constexpr size_t kCompletionBit = size_t{1}
+                                  << (std::numeric_limits<size_t>::digits - 1);
+
+template <rigtorp::WaitPolicy Producer, rigtorp::WaitPolicy Consumer,
+          bool Closable>
+struct WaitingConfig : ClosureConfig<Closable> {
+  static constexpr auto producerWaitPolicy = Producer;
+  static constexpr auto consumerWaitPolicy = Consumer;
 };
 
 static void testFunctionality() {
@@ -189,6 +207,42 @@ static void testFunctionality() {
 
 // Check overload participation without instantiating operation bodies.
 namespace constraints_test {
+using rigtorp::WaitPolicy;
+
+template <typename Config, typename Allocator = std::allocator<int>>
+concept QueueConfig =
+    requires { typename rigtorp::SPSCQueue<int, Config, Allocator>; };
+
+template <typename Queue>
+concept CanClose = requires(Queue &q) {
+  { q.complete() } noexcept;
+};
+
+template <typename Queue>
+concept CanCheckClosed = requires(const Queue &q) {
+  { q.completed() } noexcept -> std::same_as<bool>;
+};
+
+struct WrongPolicyType : rigtorp::DefaultConfig {
+  static constexpr int producerWaitPolicy = 0;
+};
+struct WrongConsumerPolicyType : rigtorp::DefaultConfig {
+  static constexpr int consumerWaitPolicy = 0;
+};
+struct WrongCloseType : rigtorp::DefaultConfig {
+  static constexpr int completable = false;
+};
+static_assert(!QueueConfig<std::allocator<int>>);
+static_assert(!QueueConfig<WrongPolicyType>);
+static_assert(!QueueConfig<WrongConsumerPolicyType>);
+static_assert(!QueueConfig<WrongCloseType>);
+using ClosableQueue = rigtorp::SPSCQueue<
+    int, WaitingConfig<WaitPolicy::Atomic, WaitPolicy::Atomic, true>>;
+static_assert(CanClose<ClosableQueue>);
+static_assert(CanCheckClosed<ClosableQueue>);
+static_assert(!CanClose<rigtorp::SPSCQueue<int>>);
+static_assert(!CanCheckClosed<rigtorp::SPSCQueue<int>>);
+
 template <typename T>
 concept QueueElement = requires { typename rigtorp::SPSCQueue<T>; };
 template <typename T, typename... Args>
@@ -432,7 +486,8 @@ static void testCustomAllocator() {
 
   TrackingAllocator<int>::State state;
   {
-    SPSCQueue<int, TrackingAllocator<int>> q(5, TrackingAllocator<int>(&state));
+    SPSCQueue<int, DefaultConfig, TrackingAllocator<int>> q(
+        5, TrackingAllocator<int>(&state));
     CHECK(state.allocations == 1);
     CHECK(state.deallocations == 0);
     CHECK(q.capacity() == 5);
@@ -450,19 +505,30 @@ static void testCustomAllocator() {
   OversizeAllocator<int>::State oversizeState;
   oversizeState.extra = 3;
   {
-    SPSCQueue<int, OversizeAllocator<int>> q(
+    SPSCQueue<int, ClosureConfig<true>, OversizeAllocator<int>> q(
         4, OversizeAllocator<int>(&oversizeState));
     CHECK(q.capacity() == 7);
     for (int i = 0; i < 7; ++i) {
       CHECK(q.try_push(i));
     }
     CHECK(!q.try_push(100));
+    CHECK(!q.completed());
+    q.complete();
     for (int i = 0; i < 7; ++i) {
       CHECK(*q.front() == i);
       q.pop();
     }
   }
   CHECK(oversizeState.deallocated == oversizeState.allocated);
+
+  // Exercise capacity capping without accessing the simulated extra slots.
+  oversizeState.reportedCount = SIZE_MAX;
+  {
+    SPSCQueue<int, ClosureConfig<true>, OversizeAllocator<int>> q(
+        4, OversizeAllocator<int>(&oversizeState));
+    CHECK(q.capacity() == kCompletionBit - 1);
+  }
+  CHECK(oversizeState.deallocated == SIZE_MAX);
 }
 
 // Adapted from PR #51: inspect allocation arithmetic without large allocations.
@@ -493,11 +559,12 @@ template <typename T> struct RecordingAtLeastAllocator : RecordingAllocator<T> {
 };
 
 // By default test char, which needs one false-sharing range at each end.
-template <typename Allocator>
+template <typename Allocator, bool Closable = false>
 static void testCapacityAllocationBounds(
     size_t padding = alignof(rigtorp::SPSCQueue<char>)) {
   using T = typename Allocator::value_type;
-  const size_t maxCapacity = SIZE_MAX - 2 * padding - 1;
+  const size_t maxCapacity =
+      Closable ? kCompletionBit - 1 : SIZE_MAX - 2 * padding - 1;
   size_t requested = 0;
   Allocator allocator;
   allocator.requested = &requested;
@@ -507,15 +574,15 @@ static void testCapacityAllocationBounds(
     requested = 0;
     bool threw = false;
     try {
-      rigtorp::SPSCQueue<T, Allocator> q(capacity, allocator);
+      rigtorp::SPSCQueue<T, ClosureConfig<Closable>, Allocator> q(capacity,
+                                                                  allocator);
     } catch (const std::bad_alloc &) {
       threw = true;
     }
     CHECK(threw);
-    const size_t expected =
-        capacity > maxCapacity
-            ? SIZE_MAX
-            : (capacity == 0 ? 1 : capacity) + 1 + 2 * padding;
+    const size_t clamped =
+        capacity == 0 ? 1 : (capacity > maxCapacity ? maxCapacity : capacity);
+    const size_t expected = clamped + 1 + 2 * padding;
     CHECK(requested == expected);
   }
 }
@@ -544,7 +611,7 @@ static void testAlignedElementPadding() {
     for (size_t capacity : {size_t{0}, size_t{1}, size_t{3}}) {
       typename TrackingAllocator<T>::State state;
       {
-        rigtorp::SPSCQueue<T, TrackingAllocator<T>> q(
+        rigtorp::SPSCQueue<T, rigtorp::DefaultConfig, TrackingAllocator<T>> q(
             capacity, TrackingAllocator<T>(&state));
         const size_t actual = capacity == 0 ? 1 : capacity;
         CHECK(q.capacity() == actual);
@@ -703,6 +770,113 @@ static void testConcurrency() {
   }
 }
 
+template <rigtorp::WaitPolicy Producer, rigtorp::WaitPolicy Consumer,
+          bool Closable>
+static void testWaitingPolicies() {
+  using Queue =
+      rigtorp::SPSCQueue<int, WaitingConfig<Producer, Consumer, Closable>>;
+  constexpr int transfers = 10000;
+  for (size_t capacity : {size_t{1}, size_t{3}}) {
+    Queue q(capacity);
+    std::thread producer([&] {
+      for (int i = 0; i < transfers; ++i) {
+        q.emplace(i);
+      }
+      if constexpr (Closable) {
+        q.complete();
+      }
+    });
+    for (int i = 0; i < transfers; ++i) {
+      auto *item = q.wait_front();
+      CHECK(item && *item == i);
+      q.pop();
+    }
+    if constexpr (Closable) {
+      CHECK(q.wait_front() == nullptr);
+      CHECK(q.completed());
+    }
+    producer.join();
+    CHECK(q.empty());
+  }
+}
+
+static void testAtomicWakeups() {
+  using namespace std::chrono_literals;
+  using Queue = constraints_test::ClosableQueue;
+
+  for (int value : {0, 1, 2}) {
+    Queue q(1);
+    std::thread consumer([&] {
+      auto *item = q.wait_front();
+      if (value == 0) {
+        CHECK(item == nullptr);
+      } else {
+        CHECK(item && *item == value);
+        q.pop();
+      }
+    });
+    std::this_thread::sleep_for(5ms);
+    if (value == 0) {
+      q.complete();
+    } else {
+      CHECK(value == 1 ? q.try_push(value) : q.try_emplace(value));
+    }
+    consumer.join();
+  }
+
+  for (bool useTryPop : {false, true}) {
+    Queue q(1);
+    q.push(1);
+    std::thread producer([&] { q.push(2); });
+    std::this_thread::sleep_for(5ms);
+    if (useTryPop) {
+      int value = 0;
+      CHECK(q.try_pop(value) && value == 1);
+    } else {
+      CHECK(q.try_consume([](int &value) { CHECK(value == 1); }));
+    }
+    producer.join();
+    CHECK(*q.wait_front() == 2);
+    q.pop();
+  }
+}
+
+static void testCloseAndDrain() {
+  using rigtorp::WaitPolicy;
+  using Queue = rigtorp::SPSCQueue<
+      int, WaitingConfig<WaitPolicy::Spin, WaitPolicy::Atomic, true>>;
+  std::array<Queue, 2> queues{Queue(2), Queue(2)};
+  for (auto &q : queues) {
+    CHECK(q.try_push(1));
+    CHECK(!q.completed());
+  }
+  CHECK(queues[0].try_push(2));
+  CHECK(!queues[0].try_push(3));
+  queues[0].complete(); // Abandon the full queue.
+  auto drain = [](Queue &q, int count) {
+    auto *item = q.front();
+    CHECK(item && *item == 1);
+    CHECK(q.wait_front() == item);
+    q.pop();
+    int value = 0;
+    if (count == 2) {
+      CHECK(q.try_pop(value) && value == 2);
+    }
+    CHECK(q.wait_front() == nullptr);
+    CHECK(q.completed() && q.empty() && q.size() == 0);
+    CHECK(q.front() == nullptr);
+    CHECK(!q.try_pop(value));
+    CHECK(!q.try_consume([](int &) { CHECK(false); }));
+  };
+  CHECK(queues[0].completed() && queues[0].size() == 2);
+  std::thread full([&] { drain(queues[0], 2); });
+  std::thread partial([&] { drain(queues[1], 1); });
+  queues[1].complete(); // Graceful shutdown of the remaining queue.
+  queues[1].complete();
+  full.join();
+  partial.join();
+}
+
 static void testDeathPopWithoutFront(bool enqueue) {
 #if (defined(__unix__) || defined(__APPLE__)) && !defined(NDEBUG)
   using namespace rigtorp;
@@ -847,10 +1021,29 @@ int main(int argc, char *argv[]) {
   testAlignedElementPadding();
   testCapacityAllocationBounds<RecordingAllocator<char>>();
   testCapacityAllocationBounds<RecordingAtLeastAllocator<char>>();
+  testCapacityAllocationBounds<RecordingAllocator<char>, true>();
+  testCapacityAllocationBounds<RecordingAtLeastAllocator<char>, true>();
   testDeathPopWithoutFront(false);
   testDeathPopWithoutFront(true);
   testTryPop();
+  std::promise<void> finished;
+  std::thread watchdog([done = finished.get_future()] {
+    CHECK(done.wait_for(std::chrono::seconds(60)) == std::future_status::ready);
+  });
   testConcurrency();
+  using rigtorp::WaitPolicy;
+  testWaitingPolicies<WaitPolicy::Spin, WaitPolicy::Spin, false>();
+  testWaitingPolicies<WaitPolicy::Spin, WaitPolicy::Atomic, false>();
+  testWaitingPolicies<WaitPolicy::Atomic, WaitPolicy::Spin, false>();
+  testWaitingPolicies<WaitPolicy::Atomic, WaitPolicy::Atomic, false>();
+  testWaitingPolicies<WaitPolicy::Spin, WaitPolicy::Spin, true>();
+  testWaitingPolicies<WaitPolicy::Spin, WaitPolicy::Atomic, true>();
+  testWaitingPolicies<WaitPolicy::Atomic, WaitPolicy::Spin, true>();
+  testWaitingPolicies<WaitPolicy::Atomic, WaitPolicy::Atomic, true>();
+  testAtomicWakeups();
+  testCloseAndDrain();
+  finished.set_value();
+  watchdog.join();
 
   return 0;
 }
