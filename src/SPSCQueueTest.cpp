@@ -242,6 +242,16 @@ static_assert(CanClose<ClosableQueue>);
 static_assert(CanCheckClosed<ClosableQueue>);
 static_assert(!CanClose<rigtorp::SPSCQueue<int>>);
 static_assert(!CanCheckClosed<rigtorp::SPSCQueue<int>>);
+static_assert(requires(rigtorp::SPSCQueue<int> &q, int &value,
+                       void (*fn)(int &) noexcept) {
+  { q.wait_pop(value) } noexcept -> std::same_as<void>;
+  { q.consume(fn) } noexcept -> std::same_as<void>;
+});
+static_assert(requires(ClosableQueue &q, int &value,
+                       void (*fn)(int &) noexcept) {
+  { q.wait_pop(value) } noexcept -> std::same_as<bool>;
+  { q.consume(fn) } noexcept -> std::same_as<bool>;
+});
 
 template <typename T>
 concept QueueElement = requires { typename rigtorp::SPSCQueue<T>; };
@@ -264,9 +274,16 @@ concept CanTryPush = requires(rigtorp::SPSCQueue<T> &q, P &&value) {
 template <typename T>
 concept CanTryPop =
     requires(rigtorp::SPSCQueue<T> &q, T &value) { q.try_pop(value); };
+template <typename T>
+concept CanWaitPop =
+    requires(rigtorp::SPSCQueue<T> &q, T &value) { q.wait_pop(value); };
 template <typename T, typename Fn>
 concept CanConsume = requires(rigtorp::SPSCQueue<T> &q, Fn &&fn) {
   q.try_consume(std::forward<Fn>(fn));
+};
+template <typename T, typename Fn>
+concept CanBlockingConsume = requires(rigtorp::SPSCQueue<T> &q, Fn &&fn) {
+  q.consume(std::forward<Fn>(fn));
 };
 struct Immovable {
   explicit Immovable(int) noexcept {}
@@ -303,17 +320,25 @@ static_assert(CanPush<CopyOnly, CopyOnly>);
 static_assert(CanTryPush<CopyOnly, CopyOnly>);
 static_assert(CanTryPop<CopyOnly>);
 static_assert(!CanTryPop<Immovable>);
+static_assert(CanWaitPop<CopyOnly>);
+static_assert(!CanWaitPop<Immovable>);
 using MoveOnly = std::unique_ptr<int>;
 static_assert(CanPush<MoveOnly, MoveOnly>);
 static_assert(CanTryPush<MoveOnly, MoveOnly>);
 static_assert(!CanPush<MoveOnly, const MoveOnly &>);
 static_assert(!CanTryPush<MoveOnly, const MoveOnly &>);
 static_assert(CanTryPop<MoveOnly>);
+static_assert(CanWaitPop<MoveOnly>);
 static_assert(CanConsume<Immovable, decltype(&Immovable::consume)>);
 static_assert(CanConsume<Immovable, RvalueCallback>);
 static_assert(!CanConsume<Immovable, RvalueCallback &>);
 static_assert(!CanConsume<Immovable, int>);
 static_assert(!CanConsume<Immovable, void (*)(int &)>);
+static_assert(CanBlockingConsume<Immovable, decltype(&Immovable::consume)>);
+static_assert(CanBlockingConsume<Immovable, RvalueCallback>);
+static_assert(!CanBlockingConsume<Immovable, RvalueCallback &>);
+static_assert(!CanBlockingConsume<Immovable, int>);
+static_assert(!CanBlockingConsume<Immovable, void (*)(int &)>);
 } // namespace constraints_test
 
 static void testTypeCategories() {
@@ -785,12 +810,33 @@ static void testWaitingPolicies() {
       }
     });
     for (int i = 0; i < transfers; ++i) {
-      auto *item = q.wait_front();
-      CHECK(item && *item == i);
-      q.pop();
+      if (i % 3 == 0) {
+        auto *item = q.wait_front();
+        CHECK(item && *item == i);
+        q.pop();
+      } else if (i % 3 == 1) {
+        int value = -1;
+        if constexpr (Closable) {
+          CHECK(q.wait_pop(value));
+        } else {
+          q.wait_pop(value);
+        }
+        CHECK(value == i);
+      } else {
+        auto checkValue = [i](int &value) { CHECK(value == i); };
+        if constexpr (Closable) {
+          CHECK(q.consume(checkValue));
+        } else {
+          q.consume(checkValue);
+        }
+      }
     }
     if constexpr (Closable) {
       CHECK(q.wait_front() == nullptr);
+      int value = -1;
+      CHECK(!q.wait_pop(value));
+      CHECK(value == -1);
+      CHECK(!q.consume([](int &) { CHECK(false); }));
       CHECK(q.completed());
     }
     producer.join();
@@ -801,38 +847,56 @@ static void testWaitingPolicies() {
 static void testAtomicWakeups() {
   using namespace std::chrono_literals;
   using Queue = constraints_test::ClosableQueue;
+  using Receive = void (*)(Queue &, int);
 
-  for (int value : {0, 1, 2}) {
-    Queue q(1);
-    std::thread consumer([&] {
-      auto *item = q.wait_front();
-      if (value == 0) {
-        CHECK(item == nullptr);
-      } else {
-        CHECK(item && *item == value);
-        q.pop();
-      }
-    });
-    std::this_thread::sleep_for(5ms);
-    if (value == 0) {
-      q.complete();
+  auto waitFront = [](Queue &q, int expected) {
+    auto *item = q.wait_front();
+    if (expected == 0) {
+      CHECK(item == nullptr);
     } else {
-      CHECK(value == 1 ? q.try_push(value) : q.try_emplace(value));
+      CHECK(item && *item == expected);
+      q.pop();
     }
-    consumer.join();
+  };
+  auto waitPop = [](Queue &q, int expected) {
+    int value = -1;
+    CHECK(q.wait_pop(value) == (expected != 0));
+    CHECK(value == (expected == 0 ? -1 : expected));
+  };
+  auto consume = [](Queue &q, int expected) {
+    int value = -1;
+    CHECK(q.consume([&value](int &item) { value = item; }) == (expected != 0));
+    CHECK(value == (expected == 0 ? -1 : expected));
+  };
+
+  for (auto receive : std::array<Receive, 3>{waitFront, waitPop, consume}) {
+    for (int value : {0, 1, 2}) {
+      Queue q(1);
+      std::thread consumer([&] { receive(q, value); });
+      std::this_thread::sleep_for(5ms);
+      if (value == 0) {
+        q.complete();
+      } else {
+        CHECK(value == 1 ? q.try_push(value) : q.try_emplace(value));
+      }
+      consumer.join();
+    }
   }
 
-  for (bool useTryPop : {false, true}) {
+  auto tryPop = [](Queue &q, int expected) {
+    int value = 0;
+    CHECK(q.try_pop(value) && value == expected);
+  };
+  auto tryConsume = [](Queue &q, int expected) {
+    CHECK(q.try_consume([expected](int &value) { CHECK(value == expected); }));
+  };
+  for (auto receive :
+       std::array<Receive, 4>{tryConsume, tryPop, consume, waitPop}) {
     Queue q(1);
     q.push(1);
     std::thread producer([&] { q.push(2); });
     std::this_thread::sleep_for(5ms);
-    if (useTryPop) {
-      int value = 0;
-      CHECK(q.try_pop(value) && value == 1);
-    } else {
-      CHECK(q.try_consume([](int &value) { CHECK(value == 1); }));
-    }
+    receive(q, 1);
     producer.join();
     CHECK(*q.wait_front() == 2);
     q.pop();
@@ -873,6 +937,16 @@ static void testCloseAndDrain() {
   queues[1].complete();
   full.join();
   partial.join();
+
+  Queue q(2);
+  CHECK(q.try_push(1));
+  CHECK(q.try_push(2));
+  q.complete();
+  int value = 0;
+  CHECK(q.wait_pop(value) && value == 1);
+  CHECK(q.consume([](int &item) { CHECK(item == 2); }));
+  CHECK(!q.wait_pop(value) && value == 1);
+  CHECK(!q.consume([](int &) { CHECK(false); }));
 }
 
 static void testDeathPopWithoutFront(bool enqueue) {
@@ -909,7 +983,7 @@ static void testDeathPopWithoutFront(bool enqueue) {
 #endif
 }
 
-static void testTryPop() {
+static void testConsumerOperations() {
   using namespace rigtorp;
 
   // Empty, wrap-around, and cached writeIdx update
@@ -935,6 +1009,11 @@ static void testTryPop() {
     CHECK(q.try_pop(out));
     CHECK(out && *out == 99);
     CHECK(!q.try_pop(out));
+    q.emplace(std::make_unique<int>(100));
+    static_assert(noexcept(q.wait_pop(out)));
+    q.wait_pop(out);
+    CHECK(out && *out == 100);
+    CHECK(q.empty());
   }
 
   // Copy-only type
@@ -954,6 +1033,43 @@ static void testTryPop() {
     CHECK(q.try_pop(out));
     CHECK(out.x == 7);
     CHECK(!q.try_pop(out));
+    q.emplace(8);
+    static_assert(noexcept(q.wait_pop(out)));
+    q.wait_pop(out);
+    CHECK(out.x == 8);
+    CHECK(q.empty());
+  }
+
+  // A throwing assignment leaves the item available for retry.
+  {
+    struct Item {
+      int value;
+      bool shouldThrow;
+      Item &operator=(Item &&source) {
+        value = source.value;
+        if (shouldThrow) {
+          ++source.value;
+          throw std::runtime_error("assignment failed");
+        }
+        return *this;
+      }
+    };
+    SPSCQueue<Item> q(1);
+    Item out{0, true};
+    static_assert(!noexcept(q.wait_pop(out)));
+    q.emplace(42, false);
+    try {
+      q.wait_pop(out);
+      CHECK(false);
+    } catch (const std::runtime_error &) {
+      CHECK(out.value == 42);
+      auto *item = q.front();
+      CHECK(item && item->value == 43);
+    }
+    out.shouldThrow = false;
+    q.wait_pop(out);
+    CHECK(out.value == 43);
+    CHECK(q.empty());
   }
 
   // Member-function callbacks use the same invocation rules as callable
@@ -979,9 +1095,21 @@ static void testTryPop() {
     CHECK(q.try_consume(&Item::consume));
     CHECK(calls == 1);
     CHECK(q.empty());
+    static_assert(noexcept(q.consume(&Item::consume)));
+    static_assert(!noexcept(q.consume(&Item::fail)));
+    q.emplace(&calls);
+    try {
+      q.consume(&Item::fail);
+      CHECK(false);
+    } catch (const std::runtime_error &) {
+      CHECK(q.front() != nullptr);
+    }
+    q.consume(&Item::consume);
+    CHECK(calls == 2);
+    CHECK(q.empty());
   }
 
-  // try_consume with immovable and move-only types
+  // In-place consumption with immovable and move-only types
   {
     struct Immovable {
       int x;
@@ -991,12 +1119,23 @@ static void testTryPop() {
       Immovable(Immovable &&) = delete;
       Immovable &operator=(Immovable &&) = delete;
     };
+    struct Callback {
+      int &observed;
+      int operator()(Immovable &item) && noexcept {
+        observed = item.x;
+        return item.x;
+      }
+    };
     SPSCQueue<Immovable> q(2);
     int observed = 0;
     CHECK(!q.try_consume([&](Immovable &v) { observed = v.x; }));
     q.emplace(123);
     CHECK(q.try_consume([&](Immovable &v) { observed = v.x; }));
     CHECK(observed == 123);
+    CHECK(q.empty());
+    q.emplace(321);
+    q.consume(Callback{observed});
+    CHECK(observed == 321);
     CHECK(q.empty());
 
     SPSCQueue<std::unique_ptr<int>> mq(2);
@@ -1023,11 +1162,11 @@ int main(int argc, char *argv[]) {
   testCapacityAllocationBounds<RecordingAtLeastAllocator<char>, true>();
   testDeathPopWithoutFront(false);
   testDeathPopWithoutFront(true);
-  testTryPop();
   std::promise<void> finished;
   std::thread watchdog([done = finished.get_future()] {
     CHECK(done.wait_for(std::chrono::seconds(60)) == std::future_status::ready);
   });
+  testConsumerOperations();
   testConcurrency();
   using rigtorp::WaitPolicy;
   testWaitingPolicies<WaitPolicy::Spin, WaitPolicy::Spin, false>();

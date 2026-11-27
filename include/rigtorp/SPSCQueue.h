@@ -55,10 +55,12 @@ concept SPSCQueueConfig = requires {
 /// lock-free std::atomic<size_t> is necessary but alone does not establish that
 /// guarantee. Atomic notifications have no portable lock-free or wait-free
 /// guarantee. Allocation and user element operations are excluded.
-/// push(), emplace(), and wait_front() may wait indefinitely.
+/// push(), emplace(), wait_front(), consume(), and wait_pop() may wait
+/// indefinitely.
 ///
 /// Enqueue operations and complete() belong to the producer; front(),
-/// wait_front(), pop(), try_pop(), and try_consume() belong to the consumer.
+/// wait_front(), pop(), consume(), try_consume(), wait_pop(), and try_pop()
+/// belong to the consumer.
 /// These two roles may run concurrently.
 /// Transferring a role between threads requires external synchronization.
 /// Construction must finish before concurrent access; destruction requires all
@@ -317,6 +319,44 @@ public:
     publish_read(nextReadIdx);
   }
 
+  /// @brief Consumer: wait for an item, process it in place, then destroy and
+  /// remove it.
+  /// @return With completion enabled, true after consumption or false if
+  /// completed and empty, without invoking fn. Otherwise returns void.
+  /// @note Uses the consumer waiting policy and shares try_consume()'s
+  /// callable requirements and exception behavior.
+  template <typename Fn>
+    requires std::is_invocable_v<Fn &&, T &>
+  RIGTORP_SPSCQUEUE_INLINE std::conditional_t<Config::completable, bool, void>
+  consume(Fn &&fn) noexcept(std::is_nothrow_invocable_v<Fn &&, T &>) {
+    auto const readIdx = reader_.readIdx;
+    while (readIdx == reader_.writeIdxCache) {
+      auto const state = writeIdx_.load(std::memory_order_acquire);
+      reader_.writeIdxCache = decode_write_index(state);
+      if (readIdx != reader_.writeIdxCache) {
+        break;
+      }
+      if constexpr (Config::completable) {
+        if (decode_completion_bit(state)) {
+          return false;
+        }
+      }
+      if constexpr (Config::consumerWaitPolicy == WaitPolicy::Atomic) {
+        writeIdx_.wait(state, std::memory_order_relaxed);
+      }
+    }
+    std::invoke(std::forward<Fn>(fn), reader_.slots[readIdx + kPadding]);
+    std::destroy_at(&reader_.slots[readIdx + kPadding]);
+    auto nextReadIdx = readIdx + 1;
+    if (nextReadIdx == reader_.capacity) [[unlikely]] {
+      nextReadIdx = 0;
+    }
+    publish_read(nextReadIdx);
+    if constexpr (Config::completable) {
+      return true;
+    }
+  }
+
   /// @brief Consumer: process the front item in place, then destroy and remove
   /// it.
   /// @return true after consumption; false if empty, without invoking fn.
@@ -347,6 +387,30 @@ public:
     }
     publish_read(nextReadIdx);
     return true;
+  }
+
+  /// @brief Consumer: wait for an item, assign it to v, then destroy and
+  /// remove it.
+  /// @return With completion enabled, true after consumption or false if
+  /// completed and empty, leaving v untouched. Otherwise returns void.
+  /// @note Uses the consumer waiting policy and shares try_pop()'s assignment
+  /// requirements and exception behavior.
+  RIGTORP_SPSCQUEUE_INLINE std::conditional_t<Config::completable, bool, void>
+  wait_pop(T &v) noexcept(std::is_move_assignable_v<T>
+                              ? std::is_nothrow_move_assignable_v<T>
+                              : std::is_nothrow_copy_assignable_v<T>)
+    requires(std::is_move_assignable_v<T> || std::is_copy_assignable_v<T>)
+  {
+    return consume(
+        [&v](T &slot) noexcept(std::is_move_assignable_v<T>
+                                   ? std::is_nothrow_move_assignable_v<T>
+                                   : std::is_nothrow_copy_assignable_v<T>) {
+          if constexpr (std::is_move_assignable_v<T>) {
+            v = std::move(slot);
+          } else {
+            v = slot;
+          }
+        });
   }
 
   /// @brief Consumer: assign the front item to v, then destroy and remove it.
