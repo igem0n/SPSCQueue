@@ -4,11 +4,14 @@
 #ifndef RIGTORP_SPSCQUEUE_H
 #define RIGTORP_SPSCQUEUE_H
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
-#include <functional>  // std::invoke
+#include <functional> // std::invoke
+#include <limits>
 #include <memory>      // std::allocator, std::construct_at, std::destroy_at
 #include <type_traits> // std::is_*_v
 #include <utility>     // std::forward
@@ -29,35 +32,57 @@
 
 namespace rigtorp {
 
+enum class WaitPolicy { Spin, Atomic };
+
+struct DefaultConfig {
+  static constexpr WaitPolicy producerWaitPolicy = WaitPolicy::Spin;
+  static constexpr WaitPolicy consumerWaitPolicy = WaitPolicy::Spin;
+  static constexpr bool completable = false;
+};
+
+template <typename Config>
+concept SPSCQueueConfig = requires {
+  requires std::same_as<decltype(Config::producerWaitPolicy), const WaitPolicy>;
+  requires std::same_as<decltype(Config::consumerWaitPolicy), const WaitPolicy>;
+  requires std::same_as<decltype(Config::completable), const bool>;
+};
+
 /// @brief Fixed-capacity queue for one producer and one consumer.
 ///
 /// Nonblocking operations use bounded atomic loads and stores without retry
-/// loops. Their queue synchronization is wait-free (and thus lock-free) when
-/// those atomic operations are wait-free; lock-free std::atomic<size_t> is
-/// necessary but alone does not establish that guarantee. Allocation and user
-/// element operations are excluded. push() and emplace() busy-wait while full
-/// and are not wait-free.
+/// loops. Without atomic notification, their queue synchronization is
+/// wait-free (and thus lock-free) when those atomic operations are wait-free;
+/// lock-free std::atomic<size_t> is necessary but alone does not establish that
+/// guarantee. Atomic notifications have no portable lock-free or wait-free
+/// guarantee. Allocation and user element operations are excluded.
+/// push(), emplace(), wait_front(), consume(), and wait_pop() may wait
+/// indefinitely.
 ///
-/// Enqueue operations belong to the producer; front(), pop(), try_pop(), and
-/// try_consume() belong to the consumer. These two roles may run concurrently.
+/// Enqueue operations and complete() belong to the producer; front(),
+/// wait_front(), pop(), consume(), try_consume(), wait_pop(), and try_pop()
+/// belong to the consumer.
+/// These two roles may run concurrently.
 /// Transferring a role between threads requires external synchronization.
 /// Construction must finish before concurrent access; destruction requires all
 /// other access to have stopped. The queue is neither copyable nor movable.
 ///
 /// @tparam T Element type; must be nothrow destructible.
+/// @tparam Config Selects the waiting policies and completion support.
 /// @tparam Allocator Controls buffer allocation and deallocation only. Element
 /// construction/destruction bypass allocator hooks and do not automatically
 /// propagate this allocator into elements.
 ///
 /// User constructors, assignment operators, destructors, and callbacks execute
 /// on the calling thread and may themselves block.
-template <typename T, typename Allocator = std::allocator<T>>
+template <typename T, SPSCQueueConfig Config = DefaultConfig,
+          typename Allocator = std::allocator<T>>
   requires std::is_nothrow_destructible_v<T>
 class SPSCQueue {
 public:
   /// @brief Allocate the queue's storage.
   /// @param capacity Requested capacity; zero becomes one. Excessive values are
-  /// clamped to leave room for padding and a slack slot.
+  /// clamped to leave room for padding, a slack slot, and the completion bit
+  /// when enabled.
   /// @param allocator Allocator to copy and use for storage management.
   /// @note allocate_at_least may increase capacity; query capacity() for the
   /// actual value. Allocation and allocator-copy exceptions propagate.
@@ -68,9 +93,8 @@ public:
     if (writer_.capacity < 1) {
       writer_.capacity = 1;
     }
-    // Prevent overflowing size_t
-    if (writer_.capacity > SIZE_MAX - 2 * kPadding - 1) {
-      writer_.capacity = SIZE_MAX - 2 * kPadding - 1;
+    if (writer_.capacity >= kMaxRingCapacity) {
+      writer_.capacity = kMaxRingCapacity - 1;
     }
     writer_.capacity++; // Needs one slack element
 
@@ -81,17 +105,24 @@ public:
       auto res =
           writer_.allocator.allocate_at_least(writer_.capacity + 2 * kPadding);
       writer_.slots = res.ptr;
-      writer_.capacity = res.count - 2 * kPadding;
+      if constexpr (Config::completable) {
+        writer_.capacity =
+            (std::min<size_t>)(res.count - 2 * kPadding, kMaxRingCapacity);
+      } else {
+        writer_.capacity = res.count - 2 * kPadding;
+      }
+      writer_.allocationCount = res.count;
     } else {
       writer_.slots = std::allocator_traits<Allocator>::allocate(
           writer_.allocator, writer_.capacity + 2 * kPadding);
+      writer_.allocationCount = writer_.capacity + 2 * kPadding;
     }
 
     reader_.slots = writer_.slots;
     reader_.capacity = writer_.capacity;
 
-    static_assert(alignof(SPSCQueue<T>) == kFalseSharingRange);
-    static_assert(sizeof(SPSCQueue<T>) >= 3 * kFalseSharingRange);
+    static_assert(alignof(SPSCQueue) >= kFalseSharingRange);
+    static_assert(sizeof(SPSCQueue) >= 3 * kFalseSharingRange);
     assert(reinterpret_cast<char *>(&readIdx_) -
                reinterpret_cast<char *>(&writeIdx_) >=
            static_cast<std::ptrdiff_t>(kFalseSharingRange));
@@ -104,14 +135,15 @@ public:
       pop();
     }
     std::allocator_traits<Allocator>::deallocate(
-        writer_.allocator, writer_.slots, writer_.capacity + 2 * kPadding);
+        writer_.allocator, writer_.slots, writer_.allocationCount);
   }
 
   SPSCQueue(const SPSCQueue &) = delete;
   SPSCQueue &operator=(const SPSCQueue &) = delete;
 
-  /// @brief Producer: construct an item in place, busy-waiting while full.
-  /// @note May wait indefinitely without consumer progress; does not sleep.
+  /// @brief Producer: construct an item in place, waiting while full.
+  /// @note Uses the producer waiting policy and may wait indefinitely without
+  /// consumer progress.
   /// T must be constructible from the forwarded arguments. If construction
   /// throws, no item is published, but arguments may have been modified.
   template <typename... Args>
@@ -127,11 +159,15 @@ public:
     }
     while (nextWriteIdx == writer_.readIdxCache) [[unlikely]] {
       writer_.readIdxCache = readIdx_.load(std::memory_order_acquire);
+      if constexpr (Config::producerWaitPolicy == WaitPolicy::Atomic) {
+        if (nextWriteIdx == writer_.readIdxCache) {
+          readIdx_.wait(nextWriteIdx, std::memory_order_relaxed);
+        }
+      }
     }
     std::construct_at(&writer_.slots[writeIdx + kPadding],
                       std::forward<Args>(args)...);
-    writer_.writeIdx = nextWriteIdx;
-    writeIdx_.store(nextWriteIdx, std::memory_order_release);
+    publish_write(nextWriteIdx);
   }
 
   /// @brief Producer: attempt in-place construction without waiting for space.
@@ -158,12 +194,11 @@ public:
     }
     std::construct_at(&writer_.slots[writeIdx + kPadding],
                       std::forward<Args>(args)...);
-    writer_.writeIdx = nextWriteIdx;
-    writeIdx_.store(nextWriteIdx, std::memory_order_release);
+    publish_write(nextWriteIdx);
     return true;
   }
 
-  /// @brief Producer: copy an item, busy-waiting while full.
+  /// @brief Producer: copy an item, waiting while full.
   /// @note Requires copy construction; shares emplace()'s waiting and exception
   /// behavior.
   RIGTORP_SPSCQUEUE_INLINE void
@@ -173,8 +208,7 @@ public:
     emplace(v);
   }
 
-  /// @brief Producer: construct from a forwarded value, busy-waiting while
-  /// full.
+  /// @brief Producer: construct from a forwarded value, waiting while full.
   /// @note T must be constructible from P&&; shares emplace()'s waiting and
   /// exception behavior.
   template <typename P>
@@ -215,7 +249,8 @@ public:
   [[nodiscard]] RIGTORP_SPSCQUEUE_INLINE T *front() noexcept {
     auto const readIdx = reader_.readIdx;
     if (readIdx == reader_.writeIdxCache) [[unlikely]] {
-      reader_.writeIdxCache = writeIdx_.load(std::memory_order_acquire);
+      reader_.writeIdxCache =
+          decode_write_index(writeIdx_.load(std::memory_order_acquire));
       if (reader_.writeIdxCache == readIdx) {
         return nullptr;
       }
@@ -223,21 +258,103 @@ public:
     return &reader_.slots[readIdx + kPadding];
   }
 
+  /// @brief Consumer: wait for the front item using the consumer waiting
+  /// policy.
+  /// @return Pointer to the front item, or nullptr if completed and empty.
+  [[nodiscard]] RIGTORP_SPSCQUEUE_INLINE T *wait_front() noexcept {
+    auto const readIdx = reader_.readIdx;
+    while (readIdx == reader_.writeIdxCache) {
+      auto const state = writeIdx_.load(std::memory_order_acquire);
+      reader_.writeIdxCache = decode_write_index(state);
+      if (readIdx != reader_.writeIdxCache) {
+        break;
+      }
+      if constexpr (Config::completable) {
+        if (decode_completion_bit(state)) {
+          return nullptr;
+        }
+      }
+      if constexpr (Config::consumerWaitPolicy == WaitPolicy::Atomic) {
+        writeIdx_.wait(state, std::memory_order_relaxed);
+      }
+    }
+    return &reader_.slots[readIdx + kPadding];
+  }
+
+  /// @brief Producer: mark the queue complete and wake a waiting consumer.
+  /// @note May be called while full. Queued items remain
+  /// available. Enqueueing after completion violates a precondition.
+  void complete() noexcept
+    requires(Config::completable)
+  {
+    writeIdx_.store(writer_.writeIdx | kCompletionBit,
+                    std::memory_order_release);
+    if constexpr (Config::consumerWaitPolicy == WaitPolicy::Atomic) {
+      writeIdx_.notify_one();
+    }
+  }
+
+  /// @brief Check from any thread whether the producer has marked the queue
+  /// complete.
+  [[nodiscard]] bool completed() const noexcept
+    requires(Config::completable)
+  {
+    return decode_completion_bit(writeIdx_.load(std::memory_order_acquire));
+  }
+
   /// @brief Consumer: destroy and remove the front item.
-  /// @pre front() returned a non-null pointer and that item has not since been
-  /// consumed. Calling pop() on an empty queue violates this precondition.
+  /// @pre front() or wait_front() returned a non-null pointer and that item
+  /// has not since been consumed. Calling pop() on an empty queue violates
+  /// this precondition.
   RIGTORP_SPSCQUEUE_INLINE void pop() noexcept {
     auto const readIdx = reader_.readIdx;
-    // A successful front() has already acquired and cached the write index.
+    // A successful front() or wait_front() has already cached the write index.
     assert(reader_.writeIdxCache != readIdx &&
-           "Can only call pop() after front() has returned a non-nullptr");
+           "pop() requires a successful front() or wait_front()");
     std::destroy_at(&reader_.slots[readIdx + kPadding]);
     auto nextReadIdx = readIdx + 1;
     if (nextReadIdx == reader_.capacity) [[unlikely]] {
       nextReadIdx = 0;
     }
-    reader_.readIdx = nextReadIdx;
-    readIdx_.store(nextReadIdx, std::memory_order_release);
+    publish_read(nextReadIdx);
+  }
+
+  /// @brief Consumer: wait for an item, process it in place, then destroy and
+  /// remove it.
+  /// @return With completion enabled, true after consumption or false if
+  /// completed and empty, without invoking fn. Otherwise returns void.
+  /// @note Uses the consumer waiting policy and shares try_consume()'s
+  /// callable requirements and exception behavior.
+  template <typename Fn>
+    requires std::is_invocable_v<Fn &&, T &>
+  RIGTORP_SPSCQUEUE_INLINE std::conditional_t<Config::completable, bool, void>
+  consume(Fn &&fn) noexcept(std::is_nothrow_invocable_v<Fn &&, T &>) {
+    auto const readIdx = reader_.readIdx;
+    while (readIdx == reader_.writeIdxCache) {
+      auto const state = writeIdx_.load(std::memory_order_acquire);
+      reader_.writeIdxCache = decode_write_index(state);
+      if (readIdx != reader_.writeIdxCache) {
+        break;
+      }
+      if constexpr (Config::completable) {
+        if (decode_completion_bit(state)) {
+          return false;
+        }
+      }
+      if constexpr (Config::consumerWaitPolicy == WaitPolicy::Atomic) {
+        writeIdx_.wait(state, std::memory_order_relaxed);
+      }
+    }
+    std::invoke(std::forward<Fn>(fn), reader_.slots[readIdx + kPadding]);
+    std::destroy_at(&reader_.slots[readIdx + kPadding]);
+    auto nextReadIdx = readIdx + 1;
+    if (nextReadIdx == reader_.capacity) [[unlikely]] {
+      nextReadIdx = 0;
+    }
+    publish_read(nextReadIdx);
+    if constexpr (Config::completable) {
+      return true;
+    }
   }
 
   /// @brief Consumer: process the front item in place, then destroy and remove
@@ -256,7 +373,8 @@ public:
   try_consume(Fn &&fn) noexcept(std::is_nothrow_invocable_v<Fn &&, T &>) {
     auto const readIdx = reader_.readIdx;
     if (readIdx == reader_.writeIdxCache) [[unlikely]] {
-      reader_.writeIdxCache = writeIdx_.load(std::memory_order_acquire);
+      reader_.writeIdxCache =
+          decode_write_index(writeIdx_.load(std::memory_order_acquire));
       if (reader_.writeIdxCache == readIdx) {
         return false;
       }
@@ -267,9 +385,32 @@ public:
     if (nextReadIdx == reader_.capacity) [[unlikely]] {
       nextReadIdx = 0;
     }
-    reader_.readIdx = nextReadIdx;
-    readIdx_.store(nextReadIdx, std::memory_order_release);
+    publish_read(nextReadIdx);
     return true;
+  }
+
+  /// @brief Consumer: wait for an item, assign it to v, then destroy and
+  /// remove it.
+  /// @return With completion enabled, true after consumption or false if
+  /// completed and empty, leaving v untouched. Otherwise returns void.
+  /// @note Uses the consumer waiting policy and shares try_pop()'s assignment
+  /// requirements and exception behavior.
+  RIGTORP_SPSCQUEUE_INLINE std::conditional_t<Config::completable, bool, void>
+  wait_pop(T &v) noexcept(std::is_move_assignable_v<T>
+                              ? std::is_nothrow_move_assignable_v<T>
+                              : std::is_nothrow_copy_assignable_v<T>)
+    requires(std::is_move_assignable_v<T> || std::is_copy_assignable_v<T>)
+  {
+    return consume(
+        [&v](T &slot) noexcept(std::is_move_assignable_v<T>
+                                   ? std::is_nothrow_move_assignable_v<T>
+                                   : std::is_nothrow_copy_assignable_v<T>) {
+          if constexpr (std::is_move_assignable_v<T>) {
+            v = std::move(slot);
+          } else {
+            v = slot;
+          }
+        });
   }
 
   /// @brief Consumer: assign the front item to v, then destroy and remove it.
@@ -301,7 +442,8 @@ public:
   /// @note Independently sampled indices are not a consistent concurrent
   /// snapshot. The result may be stale; it does not reserve items or space.
   [[nodiscard]] size_t size() const noexcept {
-    auto const writeIdx = writeIdx_.load(std::memory_order_acquire);
+    auto const writeIdx =
+        decode_write_index(writeIdx_.load(std::memory_order_acquire));
     auto const readIdx = readIdx_.load(std::memory_order_acquire);
     return writeIdx >= readIdx ? writeIdx - readIdx
                                : writer_.capacity - readIdx + writeIdx;
@@ -312,7 +454,7 @@ public:
   /// snapshot. The result may be stale; use front() before pop(), or a try_
   /// operation to check and consume an item together.
   [[nodiscard]] bool empty() const noexcept {
-    return writeIdx_.load(std::memory_order_acquire) ==
+    return decode_write_index(writeIdx_.load(std::memory_order_acquire)) ==
            readIdx_.load(std::memory_order_acquire);
   }
 
@@ -340,10 +482,48 @@ private:
           ? 0
           : (kFalseSharingRange - 1) / sizeof(T) + 1;
 
+  static constexpr size_t kCompletionBit =
+      size_t{1} << (std::numeric_limits<size_t>::digits - 1);
+  // The largest index is one less than the ring capacity (including slack).
+  static constexpr size_t kMaxRingCapacity =
+      Config::completable ? (std::min)(kCompletionBit, SIZE_MAX - 2 * kPadding)
+                          : SIZE_MAX - 2 * kPadding;
+
+  static constexpr size_t decode_write_index(size_t state) noexcept {
+    if constexpr (Config::completable) {
+      return state & ~kCompletionBit;
+    } else {
+      return state;
+    }
+  }
+
+  static constexpr bool decode_completion_bit(size_t state) noexcept
+    requires(Config::completable)
+  {
+    return (state & kCompletionBit) != 0;
+  }
+
+  RIGTORP_SPSCQUEUE_INLINE void publish_write(size_t idx) noexcept {
+    writer_.writeIdx = idx;
+    writeIdx_.store(idx, std::memory_order_release);
+    if constexpr (Config::consumerWaitPolicy == WaitPolicy::Atomic) {
+      writeIdx_.notify_one();
+    }
+  }
+
+  RIGTORP_SPSCQUEUE_INLINE void publish_read(size_t idx) noexcept {
+    reader_.readIdx = idx;
+    readIdx_.store(idx, std::memory_order_release);
+    if constexpr (Config::producerWaitPolicy == WaitPolicy::Atomic) {
+      readIdx_.notify_one();
+    }
+  }
+
 private:
   // Isolate the shared atomic indices (writeIdx_, readIdx_) on their own
   // kFalseSharingRange-aligned lines so peer polling / spatial prefetching
   // cannot drag the owning thread's private line into Shared state.
+  // The closure bit changes this value without advancing the write index.
   alignas(kFalseSharingRange) std::atomic<size_t> writeIdx_ = {0};
   struct alignas(kFalseSharingRange) {
     // Private copy of writeIdx avoids loading writeIdx_ on enqueue after a
@@ -361,6 +541,8 @@ private:
 #else
     Allocator allocator;
 #endif
+    // Keep the original count even if the usable ring had to be capped.
+    size_t allocationCount = 0;
   } writer_;
   alignas(kFalseSharingRange) std::atomic<size_t> readIdx_ = {0};
   struct alignas(kFalseSharingRange) {

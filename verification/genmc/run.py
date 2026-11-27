@@ -119,11 +119,12 @@ def main():
         header = header.replace(target, replacement, 1)
 
     mutations = [
-        ("relaxed-publication", "writeIdx_.store(nextWriteIdx, std::memory_order_release)", 2,
+        ("relaxed-publication", "writeIdx_.store(idx, std::memory_order_release)", 1,
          "memory_order_release", r"Non-atomic race|Attempt to read from uninitialized memory"),
-        ("relaxed-reclamation", "readIdx_.store(nextReadIdx, std::memory_order_release)", 2,
+        ("relaxed-reclamation", "readIdx_.store(idx, std::memory_order_release)", 1,
          "memory_order_release", r"Non-atomic race|Unordered writes"),
-        ("relaxed-acquire-consumer", "reader_.writeIdxCache = writeIdx_.load(std::memory_order_acquire)", 2,
+        ("relaxed-acquire-consumer", "reader_.writeIdxCache =\n"
+         "          decode_write_index(writeIdx_.load(std::memory_order_acquire))", 2,
          "memory_order_acquire", r"Non-atomic race|Attempt to read from uninitialized memory"),
         ("relaxed-acquire-producer", "writer_.readIdxCache = readIdx_.load(std::memory_order_acquire)", 2,
          "memory_order_acquire", r"Non-atomic race|Unordered writes"),

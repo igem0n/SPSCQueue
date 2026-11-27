@@ -35,7 +35,7 @@ int main(int argc, char *argv[]) {
 
   using namespace rigtorp;
 
-  SPSCQueue<int, Allocator<int>> q(2);
+  SPSCQueue<int, DefaultConfig, Allocator<int>> q(2);
   std::cout << q.capacity() << std::endl;
   auto t = std::thread([&] {
     while (!q.front())
